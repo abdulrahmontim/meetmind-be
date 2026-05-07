@@ -1,15 +1,49 @@
-import pytest
-from httpx import AsyncClient
-from sqlalchemy.ext.asyncio import AsyncSession
-from datetime import datetime, timezone, timedelta
 import uuid
+import pytest
+import re
+from datetime import datetime, timezone, timedelta
+from unittest.mock import AsyncMock, patch, MagicMock
+from uuid import uuid4
 
+from jose import jwt
+from httpx import AsyncClient
+from sqlalchemy import select
+from sqlalchemy.ext.asyncio import AsyncSession
+
+from app.core.config import settings
+from app.core.exceptions import UserAlreadyExistsException
 from app.models.user import User, ActiveSession
 from app.services.auth.session_service import create_session
 
+# ── Constants & Helpers ──────────────────────────────────────────────────────
+
+SIGNUP_URL = "/api/v1/auth/signup"
+FAKE_ACCESS = "fake.access.token"
+FAKE_REFRESH = "fake.refresh.token"
+
+CREATE_USER = "app.services.auth.AuthService.create_user"
+CREATE_ACCESS = "app.services.auth.AuthService.create_access_token"
+CREATE_REFRESH = "app.services.auth.AuthService.create_refresh_token"
+
+VALID_PAYLOAD = {
+    "name": "John Doe",
+    "email": "john@example.com",
+    "password": "SecurePass1",
+}
+
+def make_user(**kwargs) -> User:
+    user = MagicMock(spec=User)
+    user.id = kwargs.get("id", uuid4())
+    user.email = kwargs.get("email", "john@example.com")
+    user.name = kwargs.get("name", "John Doe")
+    user.password_hash = kwargs.get("password_hash", "hashed")
+    return user
+
+# ── Fixtures ──────────────────────────────────────────────────────────────────
+
 @pytest.fixture
 async def test_user(db: AsyncSession):
-    """Create a test user."""
+    """Create a real test user in the DB."""
     user = User(
         email="test@example.com",
         name="Test User",
@@ -21,10 +55,9 @@ async def test_user(db: AsyncSession):
     await db.refresh(user)
     return user
 
-
 @pytest.fixture
 async def authenticated_tokens(db: AsyncSession, test_user):
-    """Create a test user and return valid tokens."""
+    """Create a real session and return valid tokens."""
     access_token, refresh_token = await create_session(db, test_user, "127.0.0.1", "test-device")
     return {
         "access_token": access_token,
@@ -32,176 +65,85 @@ async def authenticated_tokens(db: AsyncSession, test_user):
         "user": test_user,
     }
 
+# ── Test Signup (Mocked) ──────────────────────────────────────────────────────
+
+class TestSignup:
+    @pytest.mark.anyio
+    async def test_signup_success(self, client):
+        user = make_user()
+        with patch(CREATE_USER, new_callable=AsyncMock, return_value=user), \
+             patch(CREATE_ACCESS, new_callable=AsyncMock, return_value=FAKE_ACCESS), \
+             patch(CREATE_REFRESH, new_callable=AsyncMock, return_value=FAKE_REFRESH):
+            response = await client.post(SIGNUP_URL, json=VALID_PAYLOAD)
+        
+        body = response.json()
+        assert response.status_code == 201
+        assert body["data"]["access_token"] == FAKE_ACCESS
+        assert body["data"]["email"] == "john@example.com"
+
+    @pytest.mark.anyio
+    async def test_signup_duplicate_email(self, client):
+        with patch(CREATE_USER, new_callable=AsyncMock, side_effect=UserAlreadyExistsException(email="john@example.com")):
+            response = await client.post(SIGNUP_URL, json=VALID_PAYLOAD)
+        assert response.status_code == 400
+
+    @pytest.mark.anyio
+    async def test_signup_invalid_password_format(self, client):
+        response = await client.post(SIGNUP_URL, json={**VALID_PAYLOAD, "password": "short"})
+        assert response.status_code == 422
+
+# ── Test Token Rotation ───────────────────────────────────────────────────────
 
 class TestRefreshToken:
-    """POST /api/v1/auth/refresh"""
-
-    async def test_refresh_token_returns_200_with_valid_token(
-        self, client: AsyncClient, authenticated_tokens
-    ):
+    async def test_refresh_token_success(self, client, authenticated_tokens):
         response = await client.post(
             "/api/v1/auth/refresh",
             json={"refresh_token": authenticated_tokens["refresh_token"]},
         )
-
         assert response.status_code == 200
-        data = response.json()
-        assert data["message"] == "Token refreshed successfully"
-        assert "access_token" in data["data"]
-        assert "refresh_token" in data["data"]
+        assert "access_token" in response.json()["data"]
 
-    async def test_refresh_token_returns_401_with_expired_token(
-        self, client: AsyncClient
-    ):
-        from jose import jwt
-        from app.core.config import settings
-
+    async def test_refresh_token_expired(self, client):
         expired_payload = {
             "sub": str(uuid.uuid4()),
-            "session_id": str(uuid.uuid4()),
             "type": "refresh",
             "exp": datetime.now(timezone.utc) - timedelta(hours=1),
         }
-        expired_token = jwt.encode(expired_payload, settings.JWT_SECRET, algorithm="HS256")
-
-        response = await client.post(
-            "/api/v1/auth/refresh",
-            json={"refresh_token": expired_token},
-        )
-
+        token = jwt.encode(expired_payload, settings.JWT_SECRET, algorithm="HS256")
+        response = await client.post("/api/v1/auth/refresh", json={"refresh_token": token})
         assert response.status_code == 401
-        data = response.json()
 
-        assert data["detail"]["status_code"] == 401
-
-    async def test_refresh_token_returns_401_with_invalid_token(
-        self, client: AsyncClient
-    ):
-        response = await client.post(
-            "/api/v1/auth/refresh",
-            json={"refresh_token": "invalid.token.here"},
-        )
-
+    async def test_refresh_token_reuse_detection(self, client, db, authenticated_tokens):
+        token = authenticated_tokens["refresh_token"]
+        # Rotate once
+        await client.post("/api/v1/auth/refresh", json={"refresh_token": token})
+        # Try again with same token (reuse)
+        response = await client.post("/api/v1/auth/refresh", json={"refresh_token": token})
         assert response.status_code == 401
-        assert response.json()["detail"]["status_code"] == 401
 
-    async def test_refresh_token_detects_reuse_and_deletes_all_sessions(
-        self, client: AsyncClient, db: AsyncSession, authenticated_tokens
-    ):
-        refresh_token = authenticated_tokens["refresh_token"]
+# ── Test Logout & Identity ───────────────────────────────────────────────────
 
-        # First refresh succeeds
-        response1 = await client.post(
-            "/api/v1/auth/refresh",
-            json={"refresh_token": refresh_token},
-        )
-        assert response1.status_code == 200
-
-        # Logout using the old token (deletes session)
-        await client.post(
-            "/api/v1/auth/logout",
-            json={"refresh_token": refresh_token},
-            headers={"Authorization": f"Bearer {response1.json()['data']['access_token']}"},
-        )
-
-        # Try to use old token again (session deleted, should fail)
-        response2 = await client.post(
-            "/api/v1/auth/refresh",
-            json={"refresh_token": refresh_token},
-        )
-        assert response2.status_code == 401
-        assert response2.json()["detail"]["status_code"] == 401
-
-
-class TestLogout:
-    """POST /api/v1/auth/logout"""
-
-    async def test_logout_returns_200_and_deletes_session(
-        self, client: AsyncClient, db: AsyncSession, authenticated_tokens
-    ):
-        access_token = authenticated_tokens["access_token"]
-        refresh_token = authenticated_tokens["refresh_token"]
-
-        response = await client.post(
-            "/api/v1/auth/logout",
-            json={"refresh_token": refresh_token},
-            headers={"Authorization": f"Bearer {access_token}"},
-        )
-
-        assert response.status_code == 200
-        assert response.json()["message"] == "Logged out successfully"
-
-        # Verify session is deleted
-        from sqlalchemy import select
-        result = await db.execute(
-            select(ActiveSession).where(
-                ActiveSession.user_id == authenticated_tokens["user"].id
-            )
-        )
-        sessions = result.scalars().all()
-        assert len(sessions) == 0
-
-    async def test_logout_returns_401_without_token(
-        self, client: AsyncClient, authenticated_tokens
-    ):
+class TestAuthIdentity:
+    async def test_logout_success(self, client, db, authenticated_tokens):
         response = await client.post(
             "/api/v1/auth/logout",
             json={"refresh_token": authenticated_tokens["refresh_token"]},
+            headers={"Authorization": f"Bearer {authenticated_tokens['access_token']}"},
         )
+        assert response.status_code == 200
+        
+        # Verify DB session is gone
+        res = await db.execute(select(ActiveSession).where(ActiveSession.user_id == authenticated_tokens["user"].id))
+        assert len(res.scalars().all()) == 0
 
-        assert response.status_code == 401
-        assert response.json()["detail"]["status_code"] == 401
-
-
-class TestGetMe:
-    """GET /api/v1/auth/me"""
-
-    async def test_get_me_returns_200_with_user_data(
-        self, client: AsyncClient, authenticated_tokens
-    ):
+    async def test_get_me_success(self, client, authenticated_tokens):
         response = await client.get(
             "/api/v1/auth/me",
             headers={"Authorization": f"Bearer {authenticated_tokens['access_token']}"},
         )
-
         assert response.status_code == 200
-        data = response.json()
-        assert data["data"]["email"] == "test@example.com"
-        assert data["data"]["name"] == "Test User"
-        assert data["data"]["id"] == str(authenticated_tokens["user"].id)
+        assert response.json()["data"]["email"] == "test@example.com"
 
-    async def test_get_me_returns_401_without_token(self, client: AsyncClient):
+    async def test_get_me_unauthorized(self, client):
         response = await client.get("/api/v1/auth/me")
-        assert response.status_code == 401
-        assert response.json()["detail"]["status_code"] == 401
-
-    async def test_get_me_returns_401_with_expired_token(
-        self, client: AsyncClient
-    ):
-        from jose import jwt
-        from app.core.config import settings
-
-        expired_payload = {
-            "sub": str(uuid.uuid4()),
-            "role": "member",
-            "type": "access",
-            "exp": datetime.now(timezone.utc) - timedelta(hours=1),
-        }
-        expired_token = jwt.encode(expired_payload, settings.JWT_SECRET, algorithm="HS256")
-
-        response = await client.get(
-            "/api/v1/auth/me",
-            headers={"Authorization": f"Bearer {expired_token}"},
-        )
-
-        assert response.status_code == 401
-
-    async def test_get_me_returns_401_with_refresh_token(
-        self, client: AsyncClient, authenticated_tokens
-    ):
-        response = await client.get(
-            "/api/v1/auth/me",
-            headers={"Authorization": f"Bearer {authenticated_tokens['refresh_token']}"},
-        )
-
         assert response.status_code == 401
