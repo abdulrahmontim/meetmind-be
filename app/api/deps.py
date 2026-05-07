@@ -11,13 +11,19 @@ from app.services.auth.session_service import decode_token
 
 DBSession = Annotated[AsyncSession, Depends(get_session)]
 
-security = HTTPBearer()
+security = HTTPBearer(auto_error=False)
 
 
 async def get_current_user(
-    credentials: HTTPAuthorizationCredentials = Depends(security),
+    credentials: HTTPAuthorizationCredentials | None = Depends(security),
     db: AsyncSession = Depends(get_session),
 ) -> User:
+    if not credentials:
+        raise HTTPException(
+            status_code=401,
+            detail={"status_code": 401, "message": "Authentication required", "data": None}
+        )
+
     token = credentials.credentials
 
     try:

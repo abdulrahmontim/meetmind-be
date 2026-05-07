@@ -56,7 +56,7 @@ class ActiveSession(Base, UUIDPrimaryKey):
     )
     device_hint: Mapped[str | None] = mapped_column(String(120))
     ip_address: Mapped[str | None] = mapped_column(String(45))
-    last_seen_at: Mapped[datetime | None] = mapped_column(DateTime)
+    last_seen_at: Mapped[datetime | None] = mapped_column(DateTime(timezone=True))
     created_at: Mapped[datetime | None] = mapped_column(
         DateTime, server_default=func.now()
     )
