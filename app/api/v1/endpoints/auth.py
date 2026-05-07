@@ -1,4 +1,4 @@
-from fastapi import APIRouter, Depends, HTTPException
+from fastapi import APIRouter, HTTPException
 from app.api.deps import CurrentUser, DBSession
 from app.schemas.auth import LogoutRequest, RefreshRequest
 from app.services.auth.session_service import invalidate_session, rotate_tokens
